@@ -11,6 +11,7 @@ BACKEND_SERVICE="option_chain_analysis.service"
 FRONTEND_SERVICE="option_chain_frontend.service"
 API_BASE="https://quantapi.phoneme.in/optionchain"
 GUI_URL="https://quanttrade.phoneme.in/optionchain"
+GUI_BASE_PATH="/optionchain"
 LOCK_FILE="/run/lock/option-chain-analysis-deploy.lock"
 
 log() {
@@ -95,7 +96,9 @@ log "Installing frontend dependencies"
 log "Building frontend"
 (
     cd "${FRONTEND_DIR}"
-    NEXT_PUBLIC_API_BASE="${API_BASE}" npm run build
+    NEXT_PUBLIC_BASE_PATH="${GUI_BASE_PATH}" \
+        NEXT_PUBLIC_API_BASE="${API_BASE}" \
+        npm run build
 )
 
 log "Validating Nginx configuration"
