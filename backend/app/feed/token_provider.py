@@ -11,13 +11,17 @@ Token handling rules (from the SOP):
 """
 from __future__ import annotations
 
+import json
 import threading
 import time
+from pathlib import Path
 from typing import Optional
 
 import requests
 
 from app.config import settings
+
+_TOKEN_CACHE = Path(__file__).resolve().parent.parent.parent / "data" / "xts_token.json"
 
 
 class TokenError(RuntimeError):
@@ -25,7 +29,8 @@ class TokenError(RuntimeError):
 
 
 class InternalTokenProvider:
-    REFRESH_MARGIN = 120  # seconds before expiry to proactively refresh
+    REFRESH_MARGIN = 120      # seconds before expiry to proactively refresh
+    MIN_MINT_INTERVAL = 30    # never mint twice within this window (gateway 429s)
 
     def __init__(
         self,
@@ -35,6 +40,7 @@ class InternalTokenProvider:
         token_path: Optional[str] = None,
         session: Optional[requests.Session] = None,
         timeout: float = 20.0,
+        cache_path: Optional[Path] = _TOKEN_CACHE,
     ):
         self.app_key = app_key or settings.XTS_APP_KEY
         self.app_password = app_password or settings.XTS_APP_PASSWORD
@@ -46,6 +52,33 @@ class InternalTokenProvider:
         self._expires_at: float = 0.0
         self._issued_at: float = 0.0
         self._lock = threading.Lock()
+        self._cache_path = cache_path   # None disables the on-disk cache (tests)
+        self._load_cache()
+
+    def _load_cache(self) -> None:
+        """Reuse a still-valid token across process restarts (saves mint quota)."""
+        if self._cache_path is None:
+            return
+        try:
+            obj = json.loads(self._cache_path.read_text())
+        except (OSError, ValueError):
+            return
+        if obj.get("key") == self.app_key and obj.get("expires_at", 0) - time.time() > self.REFRESH_MARGIN:
+            self._token = obj.get("token")
+            self._expires_at = float(obj["expires_at"])
+            self._issued_at = float(obj.get("issued_at", 0))
+
+    def _save_cache(self) -> None:
+        if self._cache_path is None:
+            return
+        try:
+            self._cache_path.parent.mkdir(parents=True, exist_ok=True)
+            self._cache_path.write_text(json.dumps({
+                "key": self.app_key, "token": self._token,
+                "expires_at": self._expires_at, "issued_at": self._issued_at,
+            }))
+        except OSError:
+            pass
 
     def _seconds_left(self) -> float:
         return self._expires_at - time.time()
@@ -66,7 +99,21 @@ class InternalTokenProvider:
             # (XTS is single-session — concurrent mints invalidate each other).
             if force and stale_token is not None and self._token not in (None, stale_token):
                 return self._token
-            return self._request_token()
+            # Throttle only PROACTIVE refreshes — the gateway 429s if we mint too
+            # often. A forced refresh follows an explicit "Invalid Token" from XTS,
+            # where minting again is exactly the right recovery, so it is exempt
+            # (the stale_token guard above already stops duplicate concurrent mints).
+            if (not force and self._token
+                    and (time.time() - self._issued_at) < self.MIN_MINT_INTERVAL):
+                return self._token
+            try:
+                return self._request_token()
+            except TokenError:
+                # Rate-limited or transient: a token that has not actually
+                # expired is still usable — prefer it over failing the request.
+                if self._token and self._seconds_left() > 0:
+                    return self._token
+                raise
 
     def _request_token(self) -> str:
         if not self.app_key or not self.app_password:
@@ -131,6 +178,7 @@ class InternalTokenProvider:
         self._token = token
         self._expires_at = now + expires_in
         self._issued_at = now
+        self._save_cache()
         return token
 
     def invalidate(self) -> None:

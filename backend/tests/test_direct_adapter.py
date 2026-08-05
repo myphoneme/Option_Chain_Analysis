@@ -45,7 +45,7 @@ class FakeSession:
 
 def test_token_404_reports_feature_flag():
     sess = FakeSession([FakeResp(404, {"detail": "Not found"})])
-    tp = InternalTokenProvider("qt_key_x", "qt_app_y", session=sess)
+    tp = InternalTokenProvider("qt_key_x", "qt_app_y", session=sess, cache_path=None)
     with pytest.raises(TokenError) as e:
         tp.get_token()
     assert "ENABLE_INTERNAL_XTS_TOKEN_API" in str(e.value)
@@ -53,7 +53,7 @@ def test_token_404_reports_feature_flag():
 
 def test_token_401_reports_bad_credentials():
     sess = FakeSession([FakeResp(401, {"detail": "bad"})])
-    tp = InternalTokenProvider("k", "p", session=sess)
+    tp = InternalTokenProvider("k", "p", session=sess, cache_path=None)
     with pytest.raises(TokenError) as e:
         tp.get_token()
     assert "Invalid internal app credentials" in str(e.value)
@@ -63,7 +63,7 @@ def test_token_success_and_caching():
     sess = FakeSession([
         FakeResp(200, {"ok": True, "token": "XTSTOK123", "expiresInSeconds": 1200}),
     ])
-    tp = InternalTokenProvider("k", "p", session=sess)
+    tp = InternalTokenProvider("k", "p", session=sess, cache_path=None)
     assert tp.get_token() == "XTSTOK123"
     # cached — no second HTTP call
     assert tp.get_token() == "XTSTOK123"
@@ -84,7 +84,7 @@ _OI = {"ExchangeInstrumentID": 61492, "OpenInterest": 169260,
 
 
 def _adapter_with(responses):
-    tp = InternalTokenProvider("k", "p", session=FakeSession([
+    tp = InternalTokenProvider("k", "p", cache_path=None, session=FakeSession([
         FakeResp(200, {"ok": True, "token": "T", "expiresInSeconds": 1200})
     ]))
     return XTSDirectAdapter(token_provider=tp, session=FakeSession(responses))
@@ -110,7 +110,7 @@ def test_invalid_token_400_triggers_refresh_and_retry():
         FakeResp(200, {"ok": True, "token": "TOK1", "expiresInSeconds": 1200}),  # initial
         FakeResp(200, {"ok": True, "token": "TOK2", "expiresInSeconds": 1200}),  # forced refresh
     ])
-    tp = InternalTokenProvider("k", "p", session=tp_sess)
+    tp = InternalTokenProvider("k", "p", session=tp_sess, cache_path=None)
     xts_sess = FakeSession([
         FakeResp(400, {"type": "error", "code": "e-session-0007", "description": "Invalid Token"}),
         FakeResp(200, {"result": {"listQuotes": [json.dumps(_TOUCHLINE)]}}),  # retry OK

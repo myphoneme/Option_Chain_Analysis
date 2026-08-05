@@ -32,6 +32,8 @@ from .token_provider import InternalTokenProvider, TokenError
 from .xts import (  # reuse proven parsers
     MSG_OI,
     MSG_TOUCHLINE,
+    SEG_BSECM,
+    SEG_BSEFO,
     SEG_NSECM,
     SEG_NSEFO,
     XTSAdapter,
@@ -183,6 +185,46 @@ class XTSDirectAdapter(FeedAdapter):
         bars.sort(key=lambda b: b["ts"])
         return bars
 
+    def intraday_bars(self, ins: Instrument, minutes: int = 5, days: int = 3) -> List[dict]:
+        """Intraday candles (default 5-minute) for tactical structure.
+
+        The audit flagged that a 10-day daily-bar structure can contradict the
+        5-minute chart a trader is actually watching; both timeframes are now
+        computed and reported separately.
+        """
+        from datetime import date, timedelta
+
+        end = date.today()
+        start = end - timedelta(days=days)
+        data = self._request(
+            "GET", "/instruments/ohlc",
+            params={
+                "exchangeSegment": ins.segment,
+                "exchangeInstrumentID": ins.instrument_id,
+                "startTime": start.strftime("%b %d %Y 091500"),
+                "endTime": end.strftime("%b %d %Y 153000"),
+                "compressionValue": minutes * 60,
+            },
+            timeout=30,
+        )
+        raw = (data.get("result") or {}).get("dataReponse", "") or ""
+        bars: List[dict] = []
+        for chunk in raw.split(","):
+            parts = chunk.strip().strip("|").split("|")
+            if len(parts) < 6:
+                continue
+            try:
+                bars.append({
+                    "ts": int(parts[0]), "open": float(parts[1]), "high": float(parts[2]),
+                    "low": float(parts[3]), "close": float(parts[4]),
+                    "volume": int(float(parts[5])),
+                    "oi": int(float(parts[6])) if len(parts) > 6 else 0,
+                })
+            except ValueError:
+                continue
+        bars.sort(key=lambda b: b["ts"])
+        return bars
+
     def previous_close_oi(self, instruments: List[Instrument]) -> Dict[int, int]:
         """{instrument_id: previous session's closing OI} (shares).
 
@@ -264,6 +306,65 @@ class XTSDirectAdapter(FeedAdapter):
     ) -> Optional[float]:
         q = self.spot_quote(underlying, kind, segment)
         return q.ltp if q else None
+
+    # Underlying symbol -> the exchange's index display name (from /instruments/indexlist).
+    _INDEX_NAME = {
+        "NIFTY": "NIFTY 50",
+        "BANKNIFTY": "NIFTY BANK",
+        "FINNIFTY": "NIFTY FIN SERVICE",
+        "MIDCPNIFTY": "NIFTY MID SELECT",
+        "NIFTYNXT50": "NIFTY NEXT 50",
+        "SENSEX": "SENSEX",
+        "SENSEX50": "SNSX50",
+        "BANKEX": "BANKEX",
+    }
+
+    def _index_map(self, cm_segment: int) -> Dict[str, int]:
+        """{INDEX NAME: instrumentID} for a cash segment, cached for the day."""
+        from datetime import date
+
+        cache = getattr(self, "_idx_cache", None)
+        if cache and cache.get("date") == date.today() and cm_segment in cache:
+            return cache[cm_segment]
+        out: Dict[str, int] = {}
+        try:
+            data = self._request("GET", "/instruments/indexlist",
+                                 params={"exchangeSegment": cm_segment})
+            for item in (data.get("result") or {}).get("indexList", []):
+                name, _, iid = str(item).rpartition("_")
+                if name and iid.isdigit():
+                    out[name.strip().upper()] = int(iid)
+        except (XTSError, TokenError):
+            return {}
+        if not cache or cache.get("date") != date.today():
+            cache = {"date": date.today()}
+        cache[cm_segment] = out
+        self._idx_cache = cache
+        return out
+
+    def index_instrument(self, underlying: str, segment: int = SEG_NSEFO) -> Optional[Instrument]:
+        """The cash INDEX instrument (not the future).
+
+        ATM/strike selection must use the index level: the front future trades at
+        a premium, which was pushing index ATM up by one or more strikes.
+        """
+        name = self._INDEX_NAME.get(underlying.upper())
+        if not name:
+            return None
+        cm_segment = SEG_BSECM if segment == SEG_BSEFO else SEG_NSECM
+        iid = self._index_map(cm_segment).get(name.upper())
+        if not iid:
+            return None
+        return Instrument(cm_segment, iid, name, underlying.upper(), "", "", None, "INDEX")
+
+    def index_quote(self, underlying: str, segment: int = SEG_NSEFO) -> Optional[NormQuote]:
+        ins = self.index_instrument(underlying, segment)
+        if ins is None:
+            return None
+        try:
+            return self.quote(ins.segment, ins.instrument_id)
+        except (XTSError, TokenError):
+            return None
 
     def spot_instrument(self, underlying: str, kind: str, segment: int = SEG_NSEFO) -> Optional[Instrument]:
         """The instrument that carries the underlying's price/volume.

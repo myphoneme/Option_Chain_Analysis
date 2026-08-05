@@ -44,6 +44,8 @@ _BEAR_BAND = 0.80
 _BULL_BAND = 1.20
 _SL_BUFFER_PCT = 0.0005   # 0.05% of spot (Step 5 spot SL buffer)
 _HARD_PREMIUM_SL_PCT = 15.0
+# Cap the spot stop distance so a far wall can't create a sub-1 reward:risk.
+_MAX_STOP_PCT = 0.01
 # ΔOI must be at least this share of total OI to be treated as a real signal
 # (guards against a few contracts of intraday noise producing a confident verdict).
 _MIN_DELTA_SHARE = 0.02
@@ -61,6 +63,8 @@ def analyze(
     spot_prev_close: Optional[float] = None,
     delta_is_day_open: bool = True,
     bars: Optional[List[dict]] = None,
+    vwap_price: Optional[float] = None,
+    intraday_bars: Optional[List[dict]] = None,
 ) -> Verdict:
     evidence: List[str] = []
     interval = snap.infer_strike_interval()
@@ -117,13 +121,14 @@ def analyze(
     change_pct = None
     if spot_prev_close and spot_prev_close > 0 and snap.spot:
         change_pct = round((snap.spot / spot_prev_close - 1) * 100, 2)
-    price_direction = _price_direction(snap.spot, spot_vwap, change_pct)
+    vwap_ref = vwap_price if vwap_price else snap.spot
+    price_direction = _price_direction(vwap_ref, spot_vwap, change_pct)
     if price_direction:
         bits = []
         if change_pct is not None:
             bits.append(f"day {change_pct:+.2f}%")
         if spot_vwap:
-            bits.append(f"spot {'above' if snap.spot >= spot_vwap else 'below'} VWAP {spot_vwap:g}")
+            bits.append(f"price {'above' if vwap_ref >= spot_vwap else 'below'} VWAP {spot_vwap:g}")
         evidence.append(f"[1] Price action: {price_direction} ({', '.join(bits)}).")
 
     # -- 1c. Weighted multi-factor model -----------------------------------
@@ -131,6 +136,8 @@ def analyze(
         rows=win, spot=snap.spot, atm=atm, expiry=snap.expiry,
         spot_vwap=spot_vwap, bars=bars,
         delta_oi_trustworthy=bool(delta_significant and delta_is_day_open),
+        vwap_price=vwap_ref,
+        intraday_bars=intraday_bars,
     )
     comp = composite(factors)
     direction = comp["direction"]
@@ -169,7 +176,7 @@ def analyze(
         )
     else:
         evidence.append("[3] Neutral/range — no directional strike selected.")
-    _apply_vwap_entry(setup, snap, atm, direction, spot_vwap)
+    _apply_vwap_entry(setup, snap, atm, direction, spot_vwap, vwap_ref)
     if setup.entry_state:
         conf_txt = (
             "" if setup.spot_confirms is None
@@ -249,7 +256,8 @@ def analyze(
 
 
 def _apply_vwap_entry(setup: TradeSetup, snap: ChainSnapshot, atm: float,
-                      direction: str, spot_vwap: Optional[float]) -> None:
+                      direction: str, spot_vwap: Optional[float],
+                      vwap_ref: Optional[float] = None) -> None:
     """Step 4 — VWAP entry timing on the selected option + spot confirmation."""
     if not setup.option_type:
         return
@@ -270,19 +278,40 @@ def _apply_vwap_entry(setup: TradeSetup, snap: ChainSnapshot, atm: float,
         setup.entry_state = "VWAP unavailable (thin volume / after-hours)"
     # spot vs Spot-VWAP direction confirmation
     if spot_vwap:
+        ref = vwap_ref if vwap_ref else snap.spot
         if direction == "BEARISH":
-            setup.spot_confirms = snap.spot < spot_vwap
+            setup.spot_confirms = ref < spot_vwap
         elif direction == "BULLISH":
-            setup.spot_confirms = snap.spot > spot_vwap
+            setup.spot_confirms = ref > spot_vwap
 
 
 # --------------------------------------------------------------------------- #
 # Trade setup (Steps 3 & 5)
 # --------------------------------------------------------------------------- #
 
+def _structure_stop(spot: float, wall: Optional[float], interval: float, long_side: bool) -> Optional[float]:
+    """Stop just beyond the invalidating wall, capped at a sane distance.
+
+    Placing the stop at the far wall produced reward:risk well under 1 whenever
+    spot sat close to the target wall (the audit's "stop too wide" finding — e.g.
+    HINDALCO risking ~69 points to make ~12). The stop is now the tighter of the
+    wall and a bounded structural distance from spot.
+    """
+    if not spot:
+        return None
+    cap = max(interval, spot * _MAX_STOP_PCT)     # never risk more than ~1% of spot
+    if long_side:
+        by_cap = spot - cap
+        lvl = max(wall, by_cap) if wall is not None else by_cap
+        return round(lvl - _SL_BUFFER_PCT * spot, 2)
+    by_cap = spot + cap
+    lvl = min(wall, by_cap) if wall is not None else by_cap
+    return round(lvl + _SL_BUFFER_PCT * spot, 2)
+
+
 def _build_trade_setup(direction, atm, interval, support, resistance, spot) -> TradeSetup:
     if direction == "BULLISH":
-        spot_sl = round(support - _SL_BUFFER_PCT * spot, 2) if support else None
+        spot_sl = _structure_stop(spot, support, interval, long_side=True)
         return TradeSetup(
             signal="LONG / Buy Call (CE)", option_type="CE",
             selected_strike=atm, alt_strike=atm - interval,   # slight ITM call = lower strike
@@ -293,7 +322,7 @@ def _build_trade_setup(direction, atm, interval, support, resistance, spot) -> T
             rr_note="Aim R:R ≥ 1:1.5. T1 books 70% at resistance; T2 trails 30% via Option-VWAP / ΔPCR flatten.",
         )
     if direction == "BEARISH":
-        spot_sl = round(resistance + _SL_BUFFER_PCT * spot, 2) if resistance else None
+        spot_sl = _structure_stop(spot, resistance, interval, long_side=False)
         return TradeSetup(
             signal="SHORT / Buy Put (PE)", option_type="PE",
             selected_strike=atm, alt_strike=atm + interval,   # slight ITM put = higher strike

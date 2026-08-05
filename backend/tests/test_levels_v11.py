@@ -182,3 +182,102 @@ def test_all_directional_outputs_have_valid_ordering():
             assert v.support_strike < spot
         if v.resistance_strike is not None:
             assert v.resistance_strike > spot
+
+
+# --------------------------------------------------------------------------- #
+# v1.2 — structural vs tactical, one-sided ΔOI, writing/buying matrix, stops
+# --------------------------------------------------------------------------- #
+
+def _bars(n, step, start=100.0, vol=1000):
+    return [{"open": start + i * step, "high": start + i * step + 1,
+             "low": start + i * step - 1, "close": start + i * step,
+             "volume": vol, "oi": 0} for i in range(n)]
+
+
+def test_structural_and_tactical_are_separate_factors():
+    """Audit: a 10-day daily structure can contradict the 5-minute chart."""
+    from app.engine.scoring import WEIGHTS, build_factors
+
+    rows = [StrikeRow(strike=100,
+                      call=OptionQuote(oi=1000, ltp=5, vwap=5, volume=100),
+                      put=OptionQuote(oi=1000, ltp=5, vwap=5, volume=100))]
+    factors = build_factors(rows=rows, spot=100, atm=100, expiry="25AUG2026",
+                            spot_vwap=None, bars=_bars(20, +1),        # daily UP
+                            delta_oi_trustworthy=False,
+                            intraday_bars=_bars(20, -1))               # 5-min DOWN
+    by = {f.name: f for f in factors}
+    assert "Structural Bias" in by and "Tactical Bias" in by
+    assert by["Structural Bias"].score > 0      # daily bullish
+    assert by["Tactical Bias"].score < 0        # intraday bearish — no longer hidden
+    assert abs(sum(WEIGHTS.values()) - 1.0) < 1e-9
+
+
+def test_one_sided_delta_oi_is_used_not_discarded():
+    """JIOFIN lost the whole 15% factor when one side was net unwinding."""
+    from app.engine.scoring import score_change_in_oi
+
+    # calls unwinding (cap removed) while puts build -> bullish, and AVAILABLE
+    rows = [StrikeRow(strike=100,
+                      call=OptionQuote(oi=5000, change_oi=-2000),
+                      put=OptionQuote(oi=5000, change_oi=+3000))]
+    f = score_change_in_oi(rows, trustworthy=True)
+    assert f.available is True
+    assert f.score > 0
+    assert "unwinding" in f.note
+
+    # puts unwinding (support leaving) -> bearish
+    rows2 = [StrikeRow(strike=100,
+                       call=OptionQuote(oi=5000, change_oi=+3000),
+                       put=OptionQuote(oi=5000, change_oi=-2000))]
+    f2 = score_change_in_oi(rows2, trustworthy=True)
+    assert f2.available is True and f2.score < 0
+
+
+def test_oi_analysis_uses_writing_vs_buying_matrix():
+    """Audit: OI alone cannot distinguish buying from writing."""
+    from app.engine.scoring import score_oi_analysis
+
+    # identical OI walls, but premium+OI say PUT WRITING (bullish support build)
+    # Puts carry the larger OI and are being WRITTEN (premium down, OI up) —
+    # the SOP's bullish support-building signature.
+    rows = [
+        StrikeRow(strike=95,
+                  call=OptionQuote(oi=800, change_oi=200, premium_change=+1.0),
+                  put=OptionQuote(oi=3000, change_oi=1500, premium_change=-2.0)),
+        StrikeRow(strike=105,
+                  call=OptionQuote(oi=800, change_oi=200, premium_change=+1.0),
+                  put=OptionQuote(oi=3000, change_oi=1500, premium_change=-2.0)),
+    ]
+    f = score_oi_analysis(rows, spot=100)
+    assert f.available and "dominant activity" in f.note
+    assert f.score > 0                      # put writing dominates -> bullish
+
+
+def test_no_premium_change_means_no_classification():
+    """Without premium direction you cannot tell writing from buying."""
+    from app.engine.scoring import score_oi_analysis
+
+    rows = [
+        StrikeRow(strike=95, call=OptionQuote(oi=1000, change_oi=500),
+                  put=OptionQuote(oi=1000, change_oi=500)),
+        StrikeRow(strike=105, call=OptionQuote(oi=1000, change_oi=500),
+                  put=OptionQuote(oi=1000, change_oi=500)),
+    ]
+    f = score_oi_analysis(rows, spot=100)
+    assert "dominant activity" not in f.note   # falls back to wall balance only
+
+
+def test_structure_stop_is_capped_so_reward_risk_is_usable():
+    """Audit: HINDALCO's ~69-point stop for a ~12-point target was unusable."""
+    from app.engine.sop import _structure_stop
+
+    # wall far below spot -> stop must be capped near 1% of spot, not at the wall
+    stop = _structure_stop(spot=1028.15, wall=960.0, interval=20, long_side=True)
+    assert stop > 1000                       # not dragged down to 960
+    assert stop < 1028.15                    # still below entry
+    risk = 1028.15 - stop
+    cap = max(20, 1028.15 * 0.01)            # max(strike interval, 1% of spot)
+    assert risk <= cap + 1                   # bounded, not the 69-point wall stop
+
+    stop_s = _structure_stop(spot=1274.8, wall=1400.0, interval=10, long_side=False)
+    assert stop_s < 1300 and stop_s > 1274.8

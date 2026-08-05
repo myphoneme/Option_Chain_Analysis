@@ -276,6 +276,9 @@ def live_verdict(
         spot_ltp = None
         spot_prev_close = None
         spot_bars = []
+        intraday_bars = []
+        vwap_price = None
+        index_ltp = None
         if hasattr(adapter, "spot_quote"):
             sq = adapter.spot_quote(underlying, kind, seg)
             if sq:
@@ -284,6 +287,14 @@ def live_verdict(
                 spot_prev_close = sq.prev_close or None
             # The quote's Close becomes TODAY's close after the session ends;
             # daily bars give the true previous session close in every state.
+            # ATM/levels must use the INDEX level, not the front future (which
+            # carries a premium and was shifting index ATM by 1-2 strikes).
+            if kind == "index" and hasattr(adapter, "index_quote"):
+                iq = adapter.index_quote(underlying, seg)
+                if iq and iq.ltp:
+                    index_ltp = iq.ltp
+            # VWAP stays self-consistent on the instrument that actually trades.
+            vwap_price = spot_ltp
             if hasattr(adapter, "spot_instrument"):
                 si = adapter.spot_instrument(underlying, kind, seg)
                 if si:
@@ -293,9 +304,13 @@ def live_verdict(
                         spot_bars = []
                     if len(spot_bars) >= 2:
                         spot_prev_close = spot_bars[-2]["close"]
+                    try:
+                        intraday_bars = adapter.intraday_bars(si, minutes=5, days=3)
+                    except Exception:  # noqa: BLE001
+                        intraday_bars = []
 
         # Reference price to centre the strike window (best-effort).
-        ref = spot or spot_ltp or adapter.reference_price(underlying, kind, exp, seg)
+        ref = spot or index_ltp or spot_ltp or adapter.reference_price(underlying, kind, exp, seg)
         if ref:
             center = ref
         else:
@@ -350,6 +365,9 @@ def live_verdict(
         # Spot: explicit -> underlying LTP -> parity on the window -> centre.
         if spot:
             spot_source = "provided"
+        elif index_ltp:
+            snap.spot = index_ltp
+            spot_source = "index"
         elif spot_ltp:
             snap.spot = spot_ltp
             spot_source = "future" if kind == "index" else "equity"
@@ -368,6 +386,8 @@ def live_verdict(
             # measured against a real market-open baseline.
             delta_is_day_open=baseline_kind in ("prev-close", "day-open"),
             bars=spot_bars,
+            intraday_bars=intraday_bars,
+            vwap_price=vwap_price,
         ))
         result["expiry_used"] = exp
         result["available_expiries"] = available

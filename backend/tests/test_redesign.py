@@ -177,12 +177,13 @@ def test_weights_sum_to_one_and_coverage_renormalises():
 
     # Only two factors available, both strongly bullish -> composite must be ~+1
     factors = [FactorScore(n, w, 0.0, False, "") for n, w in WEIGHTS.items()]
-    factors[0] = FactorScore("Market Structure", 0.25, 1.0, True, "")
-    factors[1] = FactorScore("OI Analysis", 0.20, 1.0, True, "")
+    factors[0] = FactorScore("Structural Bias", WEIGHTS["Structural Bias"], 1.0, True, "")
+    factors[1] = FactorScore("Tactical Bias", WEIGHTS["Tactical Bias"], 1.0, True, "")
     c = composite(factors)
+    expected_cov = WEIGHTS["Structural Bias"] + WEIGHTS["Tactical Bias"]
     assert c["direction"] == "BULLISH"
-    assert c["score"] > 0.99                     # renormalised, not 0.45
-    assert abs(c["coverage"] - 0.45) < 1e-6      # but coverage reflects the gap
+    assert c["score"] > 0.99                     # renormalised, not 0.25
+    assert abs(c["coverage"] - expected_cov) < 1e-6   # coverage reflects the gap
     assert c["confidence"] < 1.0                 # confidence discounted by coverage
 
 

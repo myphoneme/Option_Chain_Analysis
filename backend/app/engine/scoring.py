@@ -5,8 +5,9 @@ factors. Each factor returns a score in [-1, +1] (positive = bullish) plus a
 human note. The composite is the weighted mean over *available* factors, so a
 missing input dilutes coverage instead of dragging the result toward zero.
 
-    Market Structure   25%
-    OI Analysis        20%
+    Structural Bias    12%   (daily bars — context)
+    Tactical Bias      13%   (intraday 5-min bars — what you actually trade)
+    OI Analysis        20%   (walls + premium/OI writing-vs-buying matrix)
     Change in OI       15%
     PCR                10%
     VWAP               10%
@@ -25,7 +26,10 @@ from .indicators import market_structure, momentum, volume_confirmation
 from .models import FactorScore
 
 WEIGHTS: Dict[str, float] = {
-    "Market Structure": 0.25,
+    # The audit found a 10-day daily structure can contradict the 5-minute chart
+    # a trader is watching, so the old single 25% "Market Structure" is split.
+    "Structural Bias": 0.12,      # daily bars — context
+    "Tactical Bias": 0.13,        # intraday 5-min bars — what you trade
     "OI Analysis": 0.20,
     "Change in OI": 0.15,
     "PCR": 0.10,
@@ -75,7 +79,17 @@ def _liquid_rows(rows):
 # --------------------------------------------------------------------------- #
 
 def score_oi_analysis(rows, spot: float) -> FactorScore:
-    """Support/resistance walls: which side's wall is bigger and closer?"""
+    """Wall balance PLUS what kind of positions are being added.
+
+    The audit's point: OI alone cannot tell option BUYING from option WRITING.
+    We blend two views:
+      (a) wall balance — put wall below spot vs call wall above spot;
+      (b) the premium-change × OI-change matrix (classify.py) — writing vs
+          long build-up vs unwinding — which is what the SOP document actually
+          specifies.
+    """
+    from . import classify
+
     puts_below = [r for r in rows if r.strike <= spot and r.put.oi > 0]
     calls_above = [r for r in rows if r.strike >= spot and r.call.oi > 0]
     if not puts_below or not calls_above:
@@ -86,12 +100,37 @@ def score_oi_analysis(rows, spot: float) -> FactorScore:
     total = sup.put.oi + res.call.oi
     if total <= 0:
         return FactorScore("OI Analysis", WEIGHTS["OI Analysis"], 0.0, False, "no OI")
-    # Bigger put wall (support) => bullish.
-    score = _clip((sup.put.oi - res.call.oi) / total)
-    return FactorScore(
-        "OI Analysis", WEIGHTS["OI Analysis"], score, True,
-        f"support {int(sup.strike)} ({sup.put.oi:,}) vs resistance {int(res.strike)} ({res.call.oi:,})",
-    )
+    wall_score = _clip((sup.put.oi - res.call.oi) / total)
+
+    # (b) writing/build-up classification, OI-weighted across the window
+    num = den = 0.0
+    labels = []
+    for r in rows:
+        for q, is_call in ((r.call, True), (r.put, False)):
+            # The matrix needs BOTH premium direction and OI change — with no
+            # premium move you cannot tell writing from buying (audit's point),
+            # so such rows contribute nothing rather than defaulting to "writing".
+            if not q.oi or not q.change_oi or not q.premium_change:
+                continue
+            label = (classify.classify_call(q.premium_change, q.change_oi) if is_call
+                     else classify.classify_put(q.premium_change, q.change_oi))
+            w = classify.bias_weight(label)
+            if w:
+                num += w * q.oi
+                den += q.oi
+                labels.append(label.value)
+    note = (f"support {int(sup.strike)} ({sup.put.oi:,}) vs "
+            f"resistance {int(res.strike)} ({res.call.oi:,})")
+    if den <= 0:
+        return FactorScore("OI Analysis", WEIGHTS["OI Analysis"], wall_score, True, note)
+
+    class_score = _clip(num / den)
+    # walls describe where price is capped/floored; the matrix describes who is
+    # acting now — weight them evenly.
+    score = _clip(0.5 * wall_score + 0.5 * class_score)
+    top = max(set(labels), key=labels.count) if labels else ""
+    return FactorScore("OI Analysis", WEIGHTS["OI Analysis"], score, True,
+                       f"{note}; dominant activity: {top}")
 
 
 def score_change_in_oi(rows, trustworthy: bool) -> FactorScore:
@@ -103,13 +142,34 @@ def score_change_in_oi(rows, trustworthy: bool) -> FactorScore:
     liq = _liquid_rows(rows) or rows
     call_d = sum(r.call.change_oi for r in liq)
     put_d = sum(r.put.change_oi for r in liq)
-    if call_d <= 0 or put_d <= 0:
-        return FactorScore(name, WEIGHTS[name], 0.0, False,
-                           f"one-sided ΔOI (ΣCallΔ {call_d:,}, ΣPutΔ {put_d:,})")
-    ratio = put_d / call_d
-    # ΔPCR 0.80 / 1.20 are the document's bands; ln-scale ~0.22 puts them near ±1.
-    return FactorScore(name, WEIGHTS[name], _tanh_ratio(ratio, 0.22) or 0.0, True,
-                       f"ΔPCR {ratio:.2f} (ΣPutΔ {put_d:,} / ΣCallΔ {call_d:,})")
+
+    if call_d > 0 and put_d > 0:
+        # Both sides adding — the document's ΔPCR applies directly.
+        ratio = put_d / call_d
+        # 0.80 / 1.20 are the document's bands; ln-scale 0.22 puts them near ±1.
+        return FactorScore(name, WEIGHTS[name], _tanh_ratio(ratio, 0.22) or 0.0, True,
+                           f"ΔPCR {ratio:.2f} (ΣPutΔ {put_d:,} / ΣCallΔ {call_d:,})")
+
+    # One side (or both) is net UNWINDING. Previously the whole 15% factor was
+    # discarded — JIOFIN lost it entirely. Unwinding is directional information:
+    #   calls unwinding  = short covering / cap removed  -> bullish
+    #   puts  unwinding  = support leaving               -> bearish
+    if call_d == 0 and put_d == 0:
+        return FactorScore(name, WEIGHTS[name], 0.0, False, "no ΔOI in the window")
+
+    total = abs(call_d) + abs(put_d)
+    # put build-up and call unwinding both read bullish; the reverse reads bearish
+    signed = (put_d - call_d) / total if total else 0.0
+    # a purely one-sided read is weaker evidence than a clean two-sided ΔPCR
+    score = _clip(signed) * 0.7
+    desc = []
+    desc.append(f"ΣCallΔ {call_d:+,}")
+    desc.append(f"ΣPutΔ {put_d:+,}")
+    kind = ("call unwinding (cap removed)" if call_d < 0 <= put_d
+            else "put unwinding (support leaving)" if put_d < 0 <= call_d
+            else "both sides unwinding")
+    return FactorScore(name, WEIGHTS[name], score, True,
+                       f"{kind}: {', '.join(desc)}")
 
 
 def score_pcr(rows) -> FactorScore:
@@ -127,6 +187,12 @@ def score_pcr(rows) -> FactorScore:
 
 
 def score_vwap(spot: float, vwap: Optional[float]) -> FactorScore:
+    """`spot` here is the VWAP reference price.
+
+    For indices this is the FUTURE's LTP compared with the FUTURE's VWAP — the
+    index itself has no traded volume, and mixing index price with futures VWAP
+    would bake in the futures premium as a fake deviation.
+    """
     if not vwap or not spot:
         return FactorScore("VWAP", WEIGHTS["VWAP"], 0.0, False, "no VWAP")
     dev = (spot / vwap - 1.0)
@@ -184,18 +250,26 @@ def score_delta_gamma(rows, spot: float, expiry: str) -> FactorScore:
 
 def build_factors(rows, spot: float, atm: float, expiry: str,
                   spot_vwap: Optional[float], bars: Optional[List[dict]],
-                  delta_oi_trustworthy: bool) -> List[FactorScore]:
+                  delta_oi_trustworthy: bool,
+                  vwap_price: Optional[float] = None,
+                  intraday_bars: Optional[List[dict]] = None) -> List[FactorScore]:
     bars = bars or []
-    ms = market_structure(bars)
+    intraday_bars = intraday_bars or []
+    ms = market_structure(bars)                       # daily -> structural
+    ti = market_structure(intraday_bars)              # 5-min -> tactical
     mo = momentum(bars)
     vo = volume_confirmation(bars)
     return [
-        FactorScore("Market Structure", WEIGHTS["Market Structure"],
-                    float(ms["score"]), bool(ms["available"]), str(ms["note"])),
+        FactorScore("Structural Bias", WEIGHTS["Structural Bias"],
+                    float(ms["score"]), bool(ms["available"]),
+                    f"daily: {ms['note']}"),
+        FactorScore("Tactical Bias", WEIGHTS["Tactical Bias"],
+                    float(ti["score"]), bool(ti["available"]),
+                    f"5-min: {ti['note']}"),
         score_oi_analysis(rows, spot),
         score_change_in_oi(rows, delta_oi_trustworthy),
         score_pcr(rows),
-        score_vwap(spot, spot_vwap),
+        score_vwap(vwap_price if vwap_price else spot, spot_vwap),
         FactorScore("Volume", WEIGHTS["Volume"], float(vo["score"]),
                     bool(vo["available"]), str(vo["note"])),
         score_iv(rows, spot, atm, expiry),
