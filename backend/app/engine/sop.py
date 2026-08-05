@@ -5,16 +5,26 @@ Step 1  Directional bias via ΔPCR (ΣPutΔOI / ΣCallΔOI over the ATM±window)
           > 1.20  -> Bullish (Put writing dominant)   -> Buy CE
           0.80–1.20 -> Neutral / range -> No Trade
         Falls back to Total-OI PCR when Change-in-OI is unavailable (no baseline).
-Step 2  Support = max Put OI strike; Resistance = max Call OI strike.
+Step 2  Levels (v1.1): support = put wall STRICTLY BELOW spot, resistance =
+        call wall STRICTLY ABOVE spot; crossed walls become pivots; the strike
+        window widens when a side has no valid candidate. See levels.py.
 Step 3  Strike selection: ATM (primary) + slight-ITM (alt).
-Step 4  Entry timing via VWAP (advisory — VWAP not in the current feed).
-Step 5  Risk: spot SL at the opposing S/R wall + hard premium SL; T1/T2 at S/R.
+Step 4  Entry timing via spot-VWAP and option-VWAP.
+Step 5  Risk: spot SL at the opposing wall + hard premium SL; T1/T2 at the walls.
+Step 6  Execution gate (v1.1): target monotonicity and reward:risk are enforced;
+        an invalid setup is downgraded to WAIT rather than displayed. See
+        execution_gate.py.
+
+Direction comes from the weighted multi-factor model in scoring.py, not from a
+single rule. `confidence` is a MODEL SCORE, not a calibrated probability.
 """
 from __future__ import annotations
 
 from typing import List, Optional
 
 from . import classify, pcr
+from .execution_gate import apply as gate_apply
+from .levels import find_levels
 from .scoring import build_factors, composite
 from .models import (
     Bias,
@@ -138,14 +148,16 @@ def analyze(
         evidence.append(f"    · {f.name} ({f.weight * 100:.0f}%): {state} — {f.note}")
     the_pcr = delta_pcr if basis == "change-in-oi" else total_oi_pcr_ctx
 
-    # ---- Step 2: support / resistance walls (max OI in window) -----------
-    resistance_row = max(win, key=lambda r: r.call.oi, default=None)
-    support_row = max(win, key=lambda r: r.put.oi, default=None)
-    resistance = resistance_row.strike if resistance_row and resistance_row.call.oi else None
-    support = support_row.strike if support_row and support_row.put.oi else None
+    # ---- Step 2: support / resistance walls (v1.1 level engine) -----------
+    # Hard rule: support must be BELOW spot and resistance ABOVE it. Crossed
+    # max-OI strikes become pivots; the window widens if a side has no candidate.
+    lv = find_levels(snap.sorted_rows(), snap.spot, win)
+    support, resistance = lv.support, lv.resistance
     evidence.append(
-        f"[2] Resistance {int(resistance) if resistance else '—'} (max Call OI); "
-        f"Support {int(support) if support else '—'} (max Put OI)."
+        f"[2] Resistance {int(resistance) if resistance else '—'} (call wall above spot, "
+        f"OI {lv.resistance_oi:,}); Support {int(support) if support else '—'} "
+        f"(put wall below spot, OI {lv.support_oi:,})."
+        + (f" {lv.note}." if lv.note else "")
     )
 
     # ---- Steps 3 + 5: strike selection + trade setup ---------------------
@@ -171,6 +183,17 @@ def analyze(
             f"[5] Spot SL {int(setup.spot_stop_loss)}, hard premium SL {int(setup.hard_premium_sl_pct)}% ; "
             f"T1 {int(setup.target1)} (70%), T2 {int(setup.target2) if setup.target2 else '—'} (30%)."
         )
+
+    # ---- Execution gate: block structurally invalid trades ----------------
+    gate_ok, gate_fails, rr = gate_apply(setup, snap.spot)
+    if setup.option_type or gate_fails:
+        if gate_ok:
+            evidence.append(
+                f"[6] Execution gate PASSED"
+                + (f" (reward:risk {rr:.2f})." if rr else ".")
+            )
+        else:
+            evidence.append("[6] Execution gate BLOCKED the trade: " + "; ".join(gate_fails) + ".")
 
     # ---- table + per-strike classification labels ------------------------
     classifications: List[StrikeClassification] = []
@@ -219,6 +242,9 @@ def analyze(
         oi_direction=oi_direction, price_direction=price_direction,
         agreement=agreement,
         factors=factors, composite_score=comp["score"], coverage=comp["coverage"],
+        pivots=lv.pivots, support_oi=lv.support_oi, resistance_oi=lv.resistance_oi,
+        level_note=lv.note, trade_blocked=setup.blocked,
+        validation_failures=setup.validation_failures,
     )
 
 

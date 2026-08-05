@@ -5,8 +5,11 @@ function fnum(n: number | null) {
 }
 
 export function TradeSetupCard({ setup }: { setup: TradeSetup }) {
-  const isTrade = setup.option_type !== "";
-  const tone = isTrade
+  const blocked = setup.blocked === true;
+  const isTrade = setup.option_type !== "" && !blocked;
+  const tone = blocked
+    ? "border-amber-500/50 bg-amber-500/10"
+    : isTrade
     ? setup.option_type === "CE"
       ? "border-bull/40 bg-bull/10"
       : "border-bear/40 bg-bear/10"
@@ -16,6 +19,23 @@ export function TradeSetupCard({ setup }: { setup: TradeSetup }) {
     <div className={`card border ${tone}`}>
       <div className="label mb-2">Actionable Trade Setup · Steps 3–5</div>
       <div className="text-xl font-bold">{setup.signal}</div>
+
+      {blocked && (
+        <div className="mt-3 rounded-lg border border-amber-500/50 bg-amber-500/10 p-3 text-sm">
+          <div className="flex items-center gap-2">
+            <span className="rounded px-2 py-0.5 text-xs font-bold tracking-wide ring-1 ring-current text-amber-300">
+              BLOCKED
+            </span>
+            <span className="font-medium text-amber-200">Execution gate · level check failed</span>
+          </div>
+          <ul className="mt-2 list-disc space-y-0.5 pl-5 text-xs text-amber-100/90">
+            {(setup.validation_failures ?? []).map((f, i) => (
+              <li key={i}>{f}</li>
+            ))}
+          </ul>
+          <p className="mt-2 text-xs text-slate-400">{setup.entry_rule}</p>
+        </div>
+      )}
 
       {isTrade ? (
         <>
@@ -27,6 +47,10 @@ export function TradeSetupCard({ setup }: { setup: TradeSetup }) {
             <Field label="Hard premium SL" value={setup.hard_premium_sl_pct ? `${setup.hard_premium_sl_pct}%` : "—"} />
             <Field label="Target 1 (70%)" value={fnum(setup.target1)} />
             <Field label="Target 2 (30%)" value={fnum(setup.target2)} />
+            <Field
+              label="Reward : Risk"
+              value={setup.reward_risk != null ? `${setup.reward_risk.toFixed(2)} : 1` : "—"}
+            />
           </div>
           <div className="mt-3 rounded-lg bg-slate-900/70 p-3 text-sm">
             <div className="text-slate-300">

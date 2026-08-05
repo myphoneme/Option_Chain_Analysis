@@ -28,7 +28,7 @@ export function VerdictCard({ v }: { v: Verdict }) {
           </div>
         </div>
         <div className="text-right">
-          <div className="label">Confidence</div>
+          <div className="label" title="Weighted model output, not a backtested probability">Model Score</div>
           <div className="text-3xl font-bold tabular-nums">{conf}%</div>
         </div>
       </div>
@@ -46,6 +46,18 @@ export function VerdictCard({ v }: { v: Verdict }) {
         <Stat label="Support" value={v.support_strike ? String(v.support_strike) : "—"} />
         <Stat label="Resistance" value={v.resistance_strike ? String(v.resistance_strike) : "—"} />
       </div>
+
+      {(v.pivots?.length || v.level_note) && (
+        <div className="text-xs text-slate-400">
+          {v.pivots && v.pivots.length > 0 && (
+            <span>
+              Pivots (crossed walls):{" "}
+              <b className="text-slate-300">{v.pivots.map((p) => p.toLocaleString("en-IN")).join(", ")}</b>
+            </span>
+          )}
+          {v.level_note && <span className="ml-2 opacity-80">{v.level_note}</span>}
+        </div>
+      )}
 
       <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-slate-400">
         {v.spot_change_pct != null && (

@@ -75,6 +75,9 @@ export interface TradeSetup {
   option_vwap: number | null;
   entry_state: string;
   spot_confirms: boolean | null;
+  reward_risk?: number | null;
+  validation_failures?: string[];
+  blocked?: boolean;
 }
 
 export interface Verdict {
@@ -113,6 +116,12 @@ export interface Verdict {
   factors?: FactorScore[];
   composite_score?: number;
   coverage?: number;
+  pivots?: number[];
+  support_oi?: number;
+  resistance_oi?: number;
+  level_note?: string;
+  trade_blocked?: boolean;
+  validation_failures?: string[];
   lot_size?: number | null;
   oi_unit?: string;
   // live-only fields

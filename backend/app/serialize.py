@@ -25,6 +25,10 @@ def verdict_to_dict(v: Verdict) -> Dict[str, Any]:
         }
         for c in v.classifications
     ]
+    if v.trade_setup is not None:
+        d["trade_setup"]["reward_risk"] = v.trade_setup.reward_risk
+        d["trade_setup"]["validation_failures"] = list(v.trade_setup.validation_failures)
+        d["trade_setup"]["blocked"] = v.trade_setup.blocked
     d["factors"] = [
         {
             "name": f.name,

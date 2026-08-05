@@ -181,6 +181,10 @@ class TradeSetup:
     option_vwap: Optional[float] = None     # selected option session VWAP
     entry_state: str = ""                   # "ENTER" / "WAIT — extended" / VWAP unavailable
     spot_confirms: Optional[bool] = None    # spot vs Spot-VWAP agrees with direction?
+    # --- v1.1 execution gate ---
+    reward_risk: Optional[float] = None
+    validation_failures: List[str] = field(default_factory=list)
+    blocked: bool = False                   # True -> levels invalid, trade withheld
 
 
 @dataclass
@@ -221,3 +225,10 @@ class Verdict:
     factors: List[FactorScore] = field(default_factory=list)
     composite_score: float = 0.0            # -1..+1
     coverage: float = 0.0                   # share of model weight available
+    # --- v1.1 level engine ---
+    pivots: List[float] = field(default_factory=list)          # crossed walls
+    support_oi: int = 0
+    resistance_oi: int = 0
+    level_note: str = ""
+    trade_blocked: bool = False             # execution gate withheld the trade
+    validation_failures: List[str] = field(default_factory=list)
