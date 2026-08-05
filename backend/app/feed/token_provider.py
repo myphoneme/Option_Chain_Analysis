@@ -11,6 +11,7 @@ Token handling rules (from the SOP):
 """
 from __future__ import annotations
 
+import threading
 import time
 from typing import Optional
 
@@ -43,14 +44,29 @@ class InternalTokenProvider:
         self.timeout = timeout
         self._token: Optional[str] = None
         self._expires_at: float = 0.0
+        self._issued_at: float = 0.0
+        self._lock = threading.Lock()
 
     def _seconds_left(self) -> float:
         return self._expires_at - time.time()
 
-    def get_token(self, force: bool = False) -> str:
-        if not force and self._token and self._seconds_left() > self.REFRESH_MARGIN:
+    def _fresh(self) -> bool:
+        return bool(self._token) and self._seconds_left() > self.REFRESH_MARGIN
+
+    def get_token(self, force: bool = False, stale_token: Optional[str] = None) -> str:
+        # Fast path: valid cached token, no lock needed.
+        if not force and self._fresh():
             return self._token
-        return self._request_token()
+        with self._lock:
+            # Re-check inside the lock — another thread may have just refreshed.
+            if not force and self._fresh():
+                return self._token
+            # Forced refresh after an 'Invalid Token': if another thread already
+            # replaced the failed token, reuse theirs instead of minting again
+            # (XTS is single-session — concurrent mints invalidate each other).
+            if force and stale_token is not None and self._token not in (None, stale_token):
+                return self._token
+            return self._request_token()
 
     def _request_token(self) -> str:
         if not self.app_key or not self.app_password:
@@ -84,10 +100,20 @@ class InternalTokenProvider:
             )
         if r.status_code == 429:
             raise TokenError("429 XTS token rate limit exceeded — cache and retry later.")
-        if r.status_code == 502:
+        if r.status_code in (502, 503, 504):
+            # Distinguish "gateway app is down" (nginx serves an HTML error page)
+            # from "gateway is up but XTS upstream failed" (JSON error body).
+            body = (r.text or "")[:300].lower()
+            if "<html" in body or "nginx" in body or "bad gateway" in body:
+                raise TokenError(
+                    f"The QuantTrade gateway is DOWN (nginx {r.status_code}, no app response "
+                    f"at {self.gateway_base}). This is not a credentials problem — the API "
+                    "server behind nginx needs to be restarted by the gateway team. "
+                    "Case-study scripts still work offline."
+                )
             raise TokenError(
-                "502 — the gateway could not obtain an XTS MarketData token "
-                "(XTS credentials/service issue upstream)."
+                f"{r.status_code} — the gateway is up but could not obtain an XTS "
+                "MarketData token (XTS service/credentials issue upstream)."
             )
         if r.status_code >= 400:
             raise TokenError(f"Token endpoint HTTP {r.status_code}: {r.text[:200]}")
@@ -101,8 +127,10 @@ class InternalTokenProvider:
         if not token:
             raise TokenError(f"Token endpoint response had no token: {data}")
         expires_in = float(data.get("expiresInSeconds", 1200))
+        now = time.time()
         self._token = token
-        self._expires_at = time.time() + expires_in
+        self._expires_at = now + expires_in
+        self._issued_at = now
         return token
 
     def invalidate(self) -> None:

@@ -130,3 +130,38 @@ def conflicting_case() -> ChainSnapshot:
     return ChainSnapshot(
         underlying="TEST", spot=100, expiry="weekly", rows=rows, strike_interval=5,
     )
+
+
+def banknifty_redesign_case() -> ChainSnapshot:
+    """Redesign_OCA worked example: BANKNIFTY open 56,883, ATM 56,900.
+
+    Table transcribed from the document. ΣCallΔOI = 3,17,331, ΣPutΔOI = 2,33,062
+    → ΔPCR 0.734 (<0.80) → BEARISH; support 56,800 (max Put OI 76,284),
+    resistance 57,000 (max Call OI 1,32,907). Trade: 56,900 PE / 57,000 PE.
+    """
+    # strike: (call_oi, call_chg, put_chg, put_oi)
+    data = {
+        56500: (9915, 359, 24799, 46879),
+        56600: (4575, 2406, 27303, 36633),
+        56700: (9519, 4372, 45401, 57084),
+        56800: (26351, 19973, 59040, 76284),
+        56900: (52501, 46386, 51045, 64524),
+        57000: (132907, 92947, 21262, 60794),
+        57100: (65033, 50946, 3564, 16951),
+        57200: (65840, 43461, 3445, 13844),
+        57300: (45211, 23958, -1105, 7667),
+        57400: (30748, 12774, -1334, 3637),
+        57500: (57782, 19749, -358, 10955),
+    }
+    rows = [
+        StrikeRow(
+            strike=k,
+            call=OptionQuote(oi=co, change_oi=cc, volume=max(cc, 0) * 3),
+            put=OptionQuote(oi=po, change_oi=pc, volume=max(pc, 0) * 3),
+        )
+        for k, (co, cc, pc, po) in data.items()
+    ]
+    return ChainSnapshot(
+        underlying="BANKNIFTY", spot=56883, expiry="28JUL2026",
+        rows=rows, strike_interval=100, timestamp="2026-07-28T09:20:00+05:30",
+    )

@@ -102,14 +102,18 @@ class SnapshotStore:
             tl, oi = pair
             change_oi = self._change_oi(ins.segment, ins.instrument_id, oi.oi)
             premium_change = round(tl.ltp - tl.prev_close, 2) if tl.prev_close else 0.0
+            # XTS reports OI/volume in SHARES; NSE (and the SOP document) use
+            # CONTRACTS. Convert so our numbers match what traders cross-check.
+            lot = max(1, getattr(ins, "lot_size", 1) or 1)
             q = OptionQuote(
                 ltp=tl.ltp,
                 bid=tl.bid,
                 ask=tl.ask,
-                volume=tl.volume,
-                oi=oi.oi,
-                change_oi=change_oi,
+                volume=int(tl.volume / lot),
+                oi=int(oi.oi / lot),
+                change_oi=int(change_oi / lot),
                 premium_change=premium_change,
+                vwap=tl.vwap,
             )
             row = by_strike.setdefault(ins.strike, StrikeRow(strike=ins.strike))
             if ins.option_type == "CE":

@@ -16,7 +16,16 @@ export function VerdictCard({ v }: { v: Verdict }) {
         <div>
           <div className="label">Verdict · {v.underlying}</div>
           <div className="mt-1 text-3xl font-bold">{v.bias.replace("_", " ")}</div>
-          <div className="text-sm opacity-80">{v.premium_direction}</div>
+          <div className="text-sm opacity-80">
+            {v.delta_pcr != null
+              ? `ΔPCR ${v.delta_pcr.toFixed(2)}`
+              : v.pcr.total_oi_pcr != null
+              ? `PCR ${v.pcr.total_oi_pcr.toFixed(2)}`
+              : v.premium_direction}
+            {v.pcr_basis && v.pcr_basis !== "none" && (
+              <span className="ml-2 text-xs opacity-70">({v.pcr_basis})</span>
+            )}
+          </div>
         </div>
         <div className="text-right">
           <div className="label">Confidence</div>
@@ -37,8 +46,54 @@ export function VerdictCard({ v }: { v: Verdict }) {
         <Stat label="Support" value={v.support_strike ? String(v.support_strike) : "—"} />
         <Stat label="Resistance" value={v.resistance_strike ? String(v.resistance_strike) : "—"} />
       </div>
+
+      <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-slate-400">
+        {v.spot_change_pct != null && (
+          <span>
+            Day{" "}
+            <b className={v.spot_change_pct >= 0 ? "text-bull" : "text-bear"}>
+              {v.spot_change_pct > 0 ? "+" : ""}
+              {v.spot_change_pct}%
+            </b>
+          </span>
+        )}
+        {v.spot_vwap != null && (
+          <>
+            <span>
+              Spot-VWAP{" "}
+              <b className="tabular-nums text-slate-200">{v.spot_vwap.toLocaleString("en-IN")}</b>
+            </span>
+            <span>
+              Spot is{" "}
+              <b className={v.spot >= v.spot_vwap ? "text-bull" : "text-bear"}>
+                {v.spot >= v.spot_vwap ? "above" : "below"} VWAP
+              </b>
+            </span>
+          </>
+        )}
+      </div>
+
+      {(v.oi_direction || v.price_direction) && (
+        <div className="rounded-lg bg-slate-900/70 p-3 text-xs">
+          <div className="flex flex-wrap gap-x-5 gap-y-1">
+            <span>
+              OI positioning: <b className={dirClass(v.oi_direction)}>{v.oi_direction ?? "n/a"}</b>
+            </span>
+            <span>
+              Price action: <b className={dirClass(v.price_direction)}>{v.price_direction ?? "n/a"}</b>
+            </span>
+          </div>
+          {v.agreement && <div className="mt-1 text-slate-400">{v.agreement}</div>}
+        </div>
+      )}
     </div>
   );
+}
+
+function dirClass(dir?: string | null) {
+  if (dir === "BULLISH") return "text-bull";
+  if (dir === "BEARISH") return "text-bear";
+  return "text-slate-300";
 }
 
 function Stat({ label, value }: { label: string; value: string }) {

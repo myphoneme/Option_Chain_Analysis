@@ -5,9 +5,10 @@ import { fetchDemoVerdict, fetchLiveVerdict, fetchMeta, fetchScripts, fetchUnive
 import type { ScriptOption, Underlying, Verdict } from "@/lib/types";
 import { ScriptPicker, buildItems, type PickItem } from "@/components/ScriptPicker";
 import { VerdictCard } from "@/components/VerdictCard";
+import { TradeSetupCard } from "@/components/TradeSetupCard";
+import { ChainTable } from "@/components/ChainTable";
+import { FactorBreakdown } from "@/components/FactorBreakdown";
 import { PcrScorecardView } from "@/components/PcrScorecard";
-import { ClassificationTable } from "@/components/ClassificationTable";
-import { StrategyList } from "@/components/StrategyList";
 import { EvidenceTrail } from "@/components/EvidenceTrail";
 import { DataQualityBanner } from "@/components/DataQualityBanner";
 
@@ -165,11 +166,24 @@ export default function Home() {
           <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">
             <div className="space-y-6 lg:col-span-2">
               <VerdictCard v={verdict} />
+              {verdict.chain_table?.length > 0 && (
+                <ChainTable
+                  rows={verdict.chain_table}
+                  sums={{ call: verdict.sum_call_chg_oi, put: verdict.sum_put_chg_oi }}
+                  lotSize={verdict.lot_size}
+                />
+              )}
               <PcrScorecardView pcr={verdict.pcr} />
-              <ClassificationTable rows={verdict.classifications} atm={verdict.atm} />
             </div>
             <div className="space-y-6">
-              <StrategyList strategies={verdict.strategies} invalidation={verdict.invalidation} />
+              {verdict.trade_setup && <TradeSetupCard setup={verdict.trade_setup} />}
+              {verdict.factors && verdict.factors.length > 0 && (
+                <FactorBreakdown
+                  factors={verdict.factors}
+                  composite={verdict.composite_score ?? 0}
+                  coverage={verdict.coverage ?? 0}
+                />
+              )}
               <EvidenceTrail evidence={verdict.evidence} />
             </div>
           </div>

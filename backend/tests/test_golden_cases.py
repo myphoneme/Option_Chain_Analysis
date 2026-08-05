@@ -93,11 +93,12 @@ def test_banknifty_short_covering_edge_case():
 def test_banknifty_verdict_is_bullish():
     v = analyze(banknifty_case_study())
     # Doc: "market is bullish above 58,000 ... strongest fresh conviction is Put
-    # writing at 58,000."
+    # writing at 58,000." Under ΔPCR: ΣPutΔOI >> ΣCallΔOI -> bullish.
     assert v.bias == Bias.BULLISH
     assert v.support_strike == 58000
     assert v.invalidation.direction == "below"
-    assert v.invalidation.level == 58000
+    # Invalidation now sits just below the support wall (support - 0.05% buffer).
+    assert 57900 < v.invalidation.level <= 58000
 
 
 # --------------------------------------------------------------------------- #

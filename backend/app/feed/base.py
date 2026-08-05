@@ -21,6 +21,9 @@ class Instrument:
     option_type: str     # "CE" / "PE" / "" (for futures/equity)
     strike: Optional[float]
     series: str          # "OPTIDX", "OPTSTK", "EQ", ...
+    # Contract multiplier. XTS reports OI/volume in SHARES; NSE displays them in
+    # CONTRACTS (lots). Divide by lot_size to match NSE / the SOP document.
+    lot_size: int = 1
 
 
 @dataclass
@@ -34,6 +37,7 @@ class NormQuote:
     ask: float = 0.0
     volume: int = 0
     prev_close: float = 0.0
+    vwap: float = 0.0            # session VWAP (XTS AverageTradedPrice)
     oi: int = 0
     underlying_total_oi: int = 0
 

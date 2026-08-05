@@ -23,7 +23,7 @@ from pydantic import BaseModel, Field
 from app.engine import analyze
 from app.engine.models import ChainSnapshot, OptionQuote, StrikeRow
 from app.serialize import verdict_to_dict
-from app.demo_data import banknifty_case_study, nifty_case_study
+from app.demo_data import banknifty_case_study, banknifty_redesign_case, nifty_case_study
 
 app = FastAPI(title="Option Chain SOP Engine", version="0.1.0")
 
@@ -118,20 +118,34 @@ def scripts():
         "scripts": [
             {"id": "nifty", "label": "NIFTY (case study)", "mode": "demo", "segment": 2},
             {"id": "banknifty", "label": "BANKNIFTY (case study)", "mode": "demo", "segment": 2},
+            {"id": "banknifty_redesign", "label": "BANKNIFTY (redesign example)", "mode": "demo", "segment": 2},
         ],
     }
 
 
 @app.get("/fno/underlyings")
 def fno_underlyings():
-    """Full F&O underlying universe for the live script selector."""
-    from app.fno_universe import universe
+    """Full F&O underlying universe for the live script selector.
 
-    u = universe()
+    Sourced from the exchange instrument master (authoritative, auto-updating);
+    falls back to the bundled static list if the master is unavailable.
+    """
+    from app.config import settings
+    from app.fno_universe import live_universe, universe
+
+    u = {**universe(), "source": "static"}
+    if settings.XTS_MODE == "direct" and settings.has_app_credentials():
+        try:
+            from app.feed import build_adapter
+
+            u = live_universe(build_adapter())
+        except Exception:  # noqa: BLE001 — never break the selector
+            pass
     return {
         "indices": u["indices"],
         "stocks": u["stocks"],
         "count": len(u["indices"]) + len(u["stocks"]),
+        "source": u.get("source", "static"),
     }
 
 
@@ -190,10 +204,11 @@ def health():
 
 @app.get("/demo/{case}")
 def demo(case: str):
-    cases = {"nifty": nifty_case_study, "banknifty": banknifty_case_study}
+    cases = {"nifty": nifty_case_study, "banknifty": banknifty_case_study, "banknifty_redesign": banknifty_redesign_case}
     if case not in cases:
         raise HTTPException(404, f"unknown case '{case}'; try {list(cases)}")
-    return verdict_to_dict(analyze(cases[case]()))
+    win = 6 if case == "banknifty_redesign" else 5
+    return verdict_to_dict(analyze(cases[case](), window=win))
 
 
 @app.post("/analyze")
@@ -218,7 +233,7 @@ def live_verdict(
     """
     from app.config import settings
     from app.feed import TokenError, XTSError, build_adapter
-    from app.fno_universe import find
+    from app.fno_universe import find_live
     from app.snapshot import SnapshotStore, chain_has_oi, estimate_spot_from_chain
 
     # Direct mode is server-to-server (internal app token) — no per-user token
@@ -230,16 +245,17 @@ def live_verdict(
     else:
         token = None
 
-    meta = find(underlying)
-    seg = segment or meta.get("segment", 2)
-    kind = meta.get("kind", "stock")
-
     adapter = build_adapter(access_token=token)
     try:
         try:
             adapter.login()
         except TokenError as e:
             raise HTTPException(503, f"XTS token unavailable: {e}")
+
+        # Resolve segment/kind from the instrument master (falls back to static).
+        meta = find_live(underlying, adapter)
+        seg = segment or meta.get("segment", 2)
+        kind = meta.get("kind", "stock")
 
         exp = expiry or adapter.nearest_expiry(underlying, seg)
         if not exp:
@@ -254,8 +270,32 @@ def live_verdict(
         if not strikes:
             raise HTTPException(404, f"no strikes parsed for {underlying} {exp}")
 
+        # Underlying quote (ltp + session VWAP): equity for stocks, front future
+        # for indices. Also gives a real spot (better than the parity estimate).
+        spot_vwap = None
+        spot_ltp = None
+        spot_prev_close = None
+        spot_bars = []
+        if hasattr(adapter, "spot_quote"):
+            sq = adapter.spot_quote(underlying, kind, seg)
+            if sq:
+                spot_ltp = sq.ltp or None
+                spot_vwap = sq.vwap or None
+                spot_prev_close = sq.prev_close or None
+            # The quote's Close becomes TODAY's close after the session ends;
+            # daily bars give the true previous session close in every state.
+            if hasattr(adapter, "spot_instrument"):
+                si = adapter.spot_instrument(underlying, kind, seg)
+                if si:
+                    try:
+                        spot_bars = adapter.daily_bars(si, days=40)
+                    except Exception:  # noqa: BLE001
+                        spot_bars = []
+                    if len(spot_bars) >= 2:
+                        spot_prev_close = spot_bars[-2]["close"]
+
         # Reference price to centre the strike window (best-effort).
-        ref = spot or adapter.reference_price(underlying, kind, exp, seg)
+        ref = spot or spot_ltp or adapter.reference_price(underlying, kind, exp, seg)
         if ref:
             center = ref
         else:
@@ -271,9 +311,13 @@ def live_verdict(
             )
             center = estimate_spot_from_chain(sample_snap.rows) or strikes[len(strikes) // 2]
 
-        # Persistent store: baselines OI on first sighting so repeated analyses
-        # this session show intraday Change-in-OI.
+        # Baseline preference:
+        #  1. previous session's closing OI from daily candles — the same basis
+        #     NSE uses for "Chng in OI"; works even when the market is closed;
+        #  2. persisted market-open baseline;
+        #  3. intraday first-sighting (weakest — not a true day ΔOI).
         store = _LIVE_STORE
+        baseline_kind = "day-open" if _BASELINE.is_fresh() else "intraday"
 
         # Pass B: window of N strikes nearest the centre, BOTH legs per strike.
         near = set(sorted(strikes, key=lambda s: abs(s - center))[:max_strikes])
@@ -283,15 +327,32 @@ def live_verdict(
             quotes = adapter.fetch_quotes_for(keep)
         else:
             quotes = adapter.fetch_touchline_for(keep)
+
+        # Prefer previous-close OI as the ΔOI baseline (matches NSE, works after hours).
+        if not _BASELINE.is_fresh() and hasattr(adapter, "previous_close_oi"):
+            try:
+                prev = adapter.previous_close_oi(keep)
+            except Exception:  # noqa: BLE001 — history is best-effort
+                prev = {}
+            if len(prev) >= max(2, len(keep) // 2):
+                store = SnapshotStore()          # isolated: seeded with prev-close OI
+                for ins in keep:
+                    if ins.instrument_id in prev:
+                        store.set_baseline(ins.segment, ins.instrument_id, prev[ins.instrument_id])
+                baseline_kind = "prev-close"
+
         snap = store.build_chain(
             underlying=underlying, spot=ref or 0, expiry=exp,
             instruments=keep, quotes=quotes,
             strike_interval=meta.get("strike"),
         )
 
-        # Spot: reference price -> parity on the window -> centre (never fail).
-        if ref:
-            spot_source = "provided" if spot else "reference"
+        # Spot: explicit -> underlying LTP -> parity on the window -> centre.
+        if spot:
+            spot_source = "provided"
+        elif spot_ltp:
+            snap.spot = spot_ltp
+            spot_source = "future" if kind == "index" else "equity"
         else:
             est = estimate_spot_from_chain(snap.rows)
             snap.spot = est or center
@@ -300,35 +361,40 @@ def live_verdict(
         oi_ok = chain_has_oi(snap)
         has_delta = any(r.call.change_oi or r.put.change_oi for r in snap.rows)
         baseline_fresh = _BASELINE.is_fresh()
-        result = verdict_to_dict(analyze(snap))
+        result = verdict_to_dict(analyze(
+            snap, spot_vwap=spot_vwap, spot_ltp=spot_ltp,
+            spot_prev_close=spot_prev_close,
+            # ΔOI is only the document's "change vs previous close" when it is
+            # measured against a real market-open baseline.
+            delta_is_day_open=baseline_kind in ("prev-close", "day-open"),
+            bars=spot_bars,
+        ))
         result["expiry_used"] = exp
         result["available_expiries"] = available
         result["spot_source"] = spot_source
+        # OI/volume are reported in CONTRACTS (lots), matching the NSE chain.
+        result["lot_size"] = next((getattr(i, "lot_size", 1) for i in keep), 1)
+        result["oi_unit"] = "contracts"
         if not oi_ok:
             note = (
                 "LIMITED: no per-strike Open Interest available, so ΔOI classification, "
                 "PCR and conversion are unavailable — premium-direction read only."
             )
-        elif baseline_fresh:
-            note = (
-                "Full SOP live: OI, day-open Change-in-OI classification, PCR and conversion "
-                "are all active (against today's market-open baseline)."
-            )
+        elif baseline_kind == "prev-close":
+            note = ("Full SOP live: Change-in-OI is measured against the PREVIOUS SESSION's "
+                    "closing OI — the same basis NSE uses — so it is valid even after hours.")
+        elif baseline_kind == "day-open":
+            note = ("Full SOP live: Change-in-OI measured against today's market-open baseline.")
         elif has_delta:
-            note = (
-                "Live OI with intraday Change-in-OI (baselined from first snapshot this "
-                "session). Capture the market-open baseline for true day ΔOI."
-            )
+            note = ("Live OI with intraday Change-in-OI only (baselined from the first snapshot "
+                    "this session) — not a true day ΔOI.")
         else:
-            note = (
-                "Live OI is flowing: Total-OI PCR and OI-based support/resistance are real. "
-                "Change-in-OI baselines from this first snapshot — capture the 09:15 baseline "
-                "(POST /admin/baseline/capture) for full day-open ΔOI classification."
-            )
+            note = ("Live OI is flowing: OI walls and PCR are real, but Change-in-OI is not yet "
+                    "available for this chain.")
         result["data_quality"] = {
             "oi_available": oi_ok,
             "delta_oi_available": has_delta or baseline_fresh,
-            "baseline": "day-open" if baseline_fresh else ("intraday" if has_delta else "none"),
+            "baseline": baseline_kind,
             "spot_source": spot_source,
             "note": note,
         }

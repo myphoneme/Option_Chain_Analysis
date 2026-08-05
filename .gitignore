@@ -25,3 +25,6 @@ next-env.d.ts
 
 # ---- os ----
 .DS_Store
+
+# Word lock/temp files
+~$*

@@ -60,27 +60,29 @@ class XTSDirectAdapter(FeedAdapter):
         self._master = InstrumentMaster(self._request)
 
     # -- transport ---------------------------------------------------------
-    def _headers(self) -> Dict[str, str]:
-        return {"Authorization": self.tp.get_token(), "Content-Type": "application/json"}
-
     def _request(self, method: str, path: str, *, params=None, payload=None, timeout=None, _retry=True) -> dict:
         url = f"{self.md_base}{path}"
+        token = self.tp.get_token()
+        headers = {"Authorization": token, "Content-Type": "application/json"}
         try:
             r = self._session.request(
                 method, url, params=params, json=payload,
-                headers=self._headers(), timeout=timeout or self.timeout,
+                headers=headers, timeout=timeout or self.timeout,
             )
         except requests.RequestException as e:
             raise XTSError(f"XTS request failed ({path}): {e}") from e
-        if r.status_code in (401, 403) and _retry:
-            # token likely expired/rejected -> force one refresh and retry
-            self.tp.get_token(force=True)
-            return self._request(method, path, params=params, payload=payload, timeout=timeout, _retry=False)
         try:
             data = r.json()
         except ValueError:
+            data = None
+        # A stale/invalid XTS token can surface as 401/403 OR as HTTP 400 with
+        # code e-session-0007 / "Invalid Token". Detect either, refresh once, retry.
+        if _retry and _is_token_error(r.status_code, data):
+            self.tp.get_token(force=True, stale_token=token)
+            return self._request(method, path, params=params, payload=payload, timeout=timeout, _retry=False)
+        if data is None:
             raise XTSError(f"Non-JSON from XTS {path}: {r.text[:200]}")
-        if r.status_code >= 400:
+        if r.status_code >= 400 or (isinstance(data, dict) and data.get("type") == "error"):
             raise XTSError(f"XTS {path} HTTP {r.status_code}: {data}")
         return data
 
@@ -143,6 +145,68 @@ class XTSDirectAdapter(FeedAdapter):
             )
         return out
 
+    def daily_bars(self, ins: Instrument, days: int = 10) -> List[dict]:
+        """Daily OHLC candles incl. Open Interest.
+
+        XTS returns `result.dataReponse` as comma-separated bars, each
+        `ts|open|high|low|close|volume|oi|`. OI is in SHARES (like quotes).
+        """
+        from datetime import date, timedelta
+
+        end = date.today()
+        start = end - timedelta(days=days)
+        data = self._request(
+            "GET", "/instruments/ohlc",
+            params={
+                "exchangeSegment": ins.segment,
+                "exchangeInstrumentID": ins.instrument_id,
+                "startTime": start.strftime("%b %d %Y 091500"),
+                "endTime": end.strftime("%b %d %Y 153000"),
+                "compressionValue": 86400,      # daily
+            },
+            timeout=30,
+        )
+        raw = (data.get("result") or {}).get("dataReponse", "") or ""
+        bars: List[dict] = []
+        for chunk in raw.split(","):
+            parts = chunk.strip().strip("|").split("|")
+            if len(parts) < 7:
+                continue
+            try:
+                bars.append({
+                    "ts": int(parts[0]), "open": float(parts[1]), "high": float(parts[2]),
+                    "low": float(parts[3]), "close": float(parts[4]),
+                    "volume": int(float(parts[5])), "oi": int(float(parts[6])),
+                })
+            except ValueError:
+                continue
+        bars.sort(key=lambda b: b["ts"])
+        return bars
+
+    def previous_close_oi(self, instruments: List[Instrument]) -> Dict[int, int]:
+        """{instrument_id: previous session's closing OI} (shares).
+
+        This is the baseline NSE measures "Chng in OI" against, so it gives a
+        true day ΔOI at any time — including when the market is closed.
+        """
+        from datetime import date, datetime
+
+        today = date.today()
+        out: Dict[int, int] = {}
+        for ins in instruments:
+            try:
+                bars = self.daily_bars(ins)
+            except (XTSError, TokenError):
+                continue
+            if not bars:
+                continue
+            # Drop today's (incomplete) bar, then take the last completed session.
+            prior = [b for b in bars
+                     if datetime.fromtimestamp(b["ts"]).date() < today] or bars[:-1]
+            if prior:
+                out[ins.instrument_id] = prior[-1]["oi"]
+        return out
+
     def fetch_oi_for(self, instruments: List[Instrument]) -> Dict[int, int]:
         """OI-only batch (single call) -> {instrument_id: open_interest}.
 
@@ -198,9 +262,82 @@ class XTSDirectAdapter(FeedAdapter):
     def reference_price(
         self, underlying: str, kind: str, expiry: str, segment: int = SEG_NSEFO
     ) -> Optional[float]:
-        # Spot is resolved by the two-pass put-call-parity estimate in the
-        # analysis endpoint (works from option LTPs). No separate call needed.
+        q = self.spot_quote(underlying, kind, segment)
+        return q.ltp if q else None
+
+    def spot_instrument(self, underlying: str, kind: str, segment: int = SEG_NSEFO) -> Optional[Instrument]:
+        """The instrument that carries the underlying's price/volume.
+
+        Stocks -> the equity (NSECM). Indices -> the front-month future (the
+        index itself has no traded volume, hence no VWAP).
+        """
+        try:
+            if kind == "stock":
+                data = self._request(
+                    "GET", "/instruments/instrument/symbol",
+                    params={"exchangeSegment": SEG_NSECM, "symbol": underlying, "series": "EQ"},
+                )
+                result = data.get("result")
+                item = result[0] if isinstance(result, list) and result else result
+                iid = item.get("ExchangeInstrumentID") if isinstance(item, dict) else None
+                if iid:
+                    return Instrument(SEG_NSECM, int(iid), underlying, underlying, "", "", None, "EQ")
+            return self._master.front_future(underlying, segment)
+        except (XTSError, TokenError, ValueError, KeyError, IndexError):
+            return None
+
+    def previous_session_close(self, ins: Instrument) -> Optional[float]:
+        """Previous session's closing price from daily candles.
+
+        The quote's `Close` field is the PREVIOUS close during market hours but
+        becomes TODAY's close after the session ends — so day-change computed
+        from it reads 0% after hours. Daily bars are unambiguous in both states.
+        """
+        try:
+            bars = self.daily_bars(ins, days=12)
+        except (XTSError, TokenError):
+            return None
+        return bars[-2]["close"] if len(bars) >= 2 else None
+
+    def spot_quote(self, underlying: str, kind: str, segment: int = SEG_NSEFO) -> Optional[NormQuote]:
+        """Underlying touchline incl. session VWAP.
+
+        Stocks -> the equity (NSECM). Indices -> the front-month future (the index
+        itself has no traded volume, so no VWAP). Returns None if unresolved.
+        """
+        try:
+            if kind == "stock":
+                data = self._request(
+                    "GET", "/instruments/instrument/symbol",
+                    params={"exchangeSegment": SEG_NSECM, "symbol": underlying, "series": "EQ"},
+                )
+                result = data.get("result")
+                item = result[0] if isinstance(result, list) and result else result
+                iid = item.get("ExchangeInstrumentID") if isinstance(item, dict) else None
+                if iid:
+                    return self.quote(SEG_NSECM, int(iid))
+            fut = self._master.front_future(underlying, segment)
+            if fut:
+                return self.quote(fut.segment, fut.instrument_id)
+        except (XTSError, TokenError, ValueError, KeyError, IndexError):
+            return None
         return None
+
+
+def _is_token_error(status: int, data) -> bool:
+    """True if the XTS response indicates a stale/invalid MarketData token.
+
+    XTS returns this as HTTP 401/403, or as HTTP 400 with code 'e-session-0007'
+    / description 'Invalid Token'.
+    """
+    if status in (401, 403):
+        return True
+    if isinstance(data, dict):
+        code = str(data.get("code", "")).lower()
+        desc = str(data.get("description", "")).lower()
+        if code.startswith("e-session") or "invalid token" in desc:
+            return True
+    return False
 
 
 def _to_instrument_direct(r: dict) -> Instrument:

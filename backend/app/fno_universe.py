@@ -72,3 +72,73 @@ def find(symbol: str) -> Dict:
         if u["symbol"] == sym:
             return u
     return {}
+
+
+# --- live universe, derived from the exchange instrument master ------------
+# The static lists above are only a FALLBACK (used when the gateway/master is
+# unavailable). The master is authoritative: it always has every currently
+# tradable F&O script, so additions (e.g. KEI, BSE, LICI) and delistings are
+# handled automatically.
+
+_NICE_INDEX_LABEL = {u["symbol"]: u["label"] for u in INDICES}
+_INDEX_STRIKE = {u["symbol"]: u["strike"] for u in INDICES}
+_SEGMENTS = (2, 12)   # NSEFO, BSEFO
+
+
+def live_universe(adapter) -> Dict[str, List[Dict]]:
+    """Universe from the instrument master; falls back to the static lists."""
+    master = getattr(adapter, "_master", None)
+    if master is None:
+        return {**universe(), "source": "static"}
+
+    indices: List[Dict] = []
+    stocks: List[Dict] = []
+    ok = False
+    failed_segments: List[int] = []
+    for seg in _SEGMENTS:
+        try:
+            rows = master.underlyings(seg)
+        except Exception:  # noqa: BLE001 — segment unavailable (gateway down / no cache)
+            failed_segments.append(seg)
+            continue
+        ok = True
+        for u in rows:
+            if u["kind"] == "index":
+                u = {**u,
+                     "label": _NICE_INDEX_LABEL.get(u["symbol"], u["symbol"]),
+                     "strike": _INDEX_STRIKE.get(u["symbol"])}
+                indices.append(u)
+            else:
+                stocks.append(u)
+    if not ok:
+        return {**universe(), "source": "static"}
+
+    # Any segment the master couldn't serve keeps its bundled entries, so we
+    # never silently lose scripts (e.g. BSE SENSEX/BANKEX when BSEFO fails).
+    if failed_segments:
+        have = {u["symbol"] for u in indices} | {u["symbol"] for u in stocks}
+        for u in all_underlyings():
+            if u.get("segment") in failed_segments and u["symbol"] not in have:
+                (indices if u["kind"] == "index" else stocks).append(u)
+
+    indices.sort(key=lambda u: u["symbol"])
+    stocks.sort(key=lambda u: u["symbol"])
+    source = "instrument-master" + (f" (+static for segments {failed_segments})" if failed_segments else "")
+    return {"indices": indices, "stocks": stocks, "source": source}
+
+
+def find_live(symbol: str, adapter=None) -> Dict:
+    """Resolve a symbol's segment/kind/lot from the master, else the static list."""
+    sym = symbol.upper()
+    master = getattr(adapter, "_master", None) if adapter else None
+    if master is not None:
+        for seg in _SEGMENTS:
+            try:
+                for u in master.underlyings(seg):
+                    if u["symbol"] == sym:
+                        if u["kind"] == "index":
+                            u = {**u, "strike": _INDEX_STRIKE.get(sym)}
+                        return u
+            except Exception:  # noqa: BLE001
+                continue
+    return find(sym)

@@ -25,4 +25,15 @@ def verdict_to_dict(v: Verdict) -> Dict[str, Any]:
         }
         for c in v.classifications
     ]
+    d["factors"] = [
+        {
+            "name": f.name,
+            "weight": f.weight,
+            "score": round(f.score, 3),
+            "available": f.available,
+            "note": f.note,
+            "contribution": round(f.contribution, 4),
+        }
+        for f in v.factors
+    ]
     return d

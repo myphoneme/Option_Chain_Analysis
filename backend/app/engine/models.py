@@ -54,6 +54,7 @@ class OptionQuote:
     oi: int = 0
     change_oi: int = 0            # fresh change in OI vs previous snapshot / prev close
     premium_change: float = 0.0   # LTP change vs previous snapshot / prev close
+    vwap: float = 0.0             # session VWAP (XTS AverageTradedPrice)
     iv: Optional[float] = None
 
 
@@ -134,6 +135,55 @@ class Invalidation:
 
 
 @dataclass
+class FactorScore:
+    """One input of the weighted scoring model."""
+    name: str
+    weight: float            # 0..1
+    score: float             # -1 (bearish) .. +1 (bullish)
+    available: bool
+    note: str = ""
+
+    @property
+    def contribution(self) -> float:
+        return self.weight * self.score if self.available else 0.0
+
+
+@dataclass
+class ChainRow:
+    """One strike row of the option-chain table (Redesign_OCA layout)."""
+    strike: float
+    call_oi: int
+    call_chg_oi: int
+    call_pct_chg: float       # chg_oi / oi * 100
+    put_oi: int
+    put_chg_oi: int
+    put_pct_chg: float
+    is_atm: bool = False
+    is_support: bool = False
+    is_resistance: bool = False
+
+
+@dataclass
+class TradeSetup:
+    """Actionable trade setup per Redesign_OCA Steps 3-5."""
+    signal: str                    # "LONG / Buy Call (CE)" | "SHORT / Buy Put (PE)" | "No Trade"
+    option_type: str               # "CE" | "PE" | ""
+    selected_strike: Optional[float]        # ATM
+    alt_strike: Optional[float]             # slight ITM
+    entry_rule: str
+    spot_stop_loss: Optional[float]
+    hard_premium_sl_pct: Optional[float]    # e.g. 15.0
+    target1: Optional[float]                # 70% exit (nearest S/R)
+    target2: Optional[float]                # 30% runner (next S/R)
+    rr_note: str = ""
+    # --- Step 4: VWAP entry timing ---
+    option_ltp: Optional[float] = None      # selected option premium
+    option_vwap: Optional[float] = None     # selected option session VWAP
+    entry_state: str = ""                   # "ENTER" / "WAIT — extended" / VWAP unavailable
+    spot_confirms: Optional[bool] = None    # spot vs Spot-VWAP agrees with direction?
+
+
+@dataclass
 class Verdict:
     underlying: str
     spot: float
@@ -148,5 +198,26 @@ class Verdict:
     classifications: List[StrikeClassification]
     strategies: List[StrategySuggestion]
     invalidation: Optional[Invalidation]
-    evidence: List[str]               # the 9-step narrative
+    evidence: List[str]               # the 5-step narrative
     timestamp: Optional[str] = None
+    # --- Redesign_OCA additions ---
+    direction: str = "NEUTRAL"        # BULLISH | BEARISH | NEUTRAL
+    delta_pcr: Optional[float] = None       # ΣPutΔOI / ΣCallΔOI over window
+    pcr_basis: str = "none"           # "change-in-oi" | "total-oi"
+    sum_call_oi: int = 0
+    sum_put_oi: int = 0
+    sum_call_chg_oi: int = 0
+    sum_put_chg_oi: int = 0
+    chain_table: List[ChainRow] = field(default_factory=list)
+    trade_setup: Optional[TradeSetup] = None
+    spot_ltp: Optional[float] = None        # underlying LTP (equity / front future)
+    spot_vwap: Optional[float] = None       # underlying session VWAP
+    spot_prev_close: Optional[float] = None
+    spot_change_pct: Optional[float] = None # day change % (price action)
+    oi_direction: Optional[str] = None      # direction from ΔPCR (None if unavailable)
+    price_direction: Optional[str] = None   # direction from price action
+    agreement: str = ""                     # human summary of the cross-check
+    # --- weighted scoring model ---
+    factors: List[FactorScore] = field(default_factory=list)
+    composite_score: float = 0.0            # -1..+1
+    coverage: float = 0.0                   # share of model weight available

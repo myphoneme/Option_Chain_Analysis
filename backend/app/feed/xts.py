@@ -36,9 +36,11 @@ SEG_BSECM = 11
 SEG_BSEFO = 12
 SEG_MCXFO = 51
 
-# Instrument name pattern: "NIFTY 25AUG2026 PE 23400"
+# Instrument name pattern: "NIFTY 25AUG2026 PE 23400".
+# The symbol may contain digits, & . _ or - (M&M, BAJAJ-AUTO, 360ONE, NAM-INDIA,
+# GVT&D, NIFTYNXT50) — a letters-only class silently dropped those scripts.
 _OPT_RE = re.compile(
-    r"^(?P<underlying>[A-Z]+)\s+(?P<expiry>\d{2}[A-Z]{3}\d{4})\s+"
+    r"^(?P<underlying>[A-Z0-9&._-]+)\s+(?P<expiry>\d{2}[A-Z]{3}\d{4})\s+"
     r"(?P<type>CE|PE)\s+(?P<strike>\d+(?:\.\d+)?)$"
 )
 
@@ -171,6 +173,8 @@ class XTSAdapter(FeedAdapter):
         bid = (q.get("BidInfo") or {}).get("Price", q.get("bid", 0.0))
         ask = (q.get("AskInfo") or {}).get("Price", q.get("ask", 0.0))
         volume = q.get("TotalTradedQuantity", q.get("volume", 0))
+        # AverageTradedPrice = TotalValueTraded / TotalTradedQuantity = session VWAP.
+        vwap = q.get("AverageTradedPrice", q.get("vwap", 0.0))
         return NormQuote(
             segment=segment,
             instrument_id=instrument_id,
@@ -179,6 +183,7 @@ class XTSAdapter(FeedAdapter):
             ask=float(ask or 0.0),
             volume=int(volume or 0),
             prev_close=float(close or 0.0),
+            vwap=float(vwap or 0.0),
         )
 
     @staticmethod

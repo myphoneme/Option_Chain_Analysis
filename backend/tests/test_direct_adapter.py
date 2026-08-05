@@ -103,6 +103,25 @@ def test_direct_batch_quotes_returns_real_oi():
     assert ad.supports_oi is True
 
 
+def test_invalid_token_400_triggers_refresh_and_retry():
+    # Reproduces the live e-session-0007 'Invalid Token' (HTTP 400): the adapter
+    # must refresh the token and retry once, then succeed.
+    tp_sess = FakeSession([
+        FakeResp(200, {"ok": True, "token": "TOK1", "expiresInSeconds": 1200}),  # initial
+        FakeResp(200, {"ok": True, "token": "TOK2", "expiresInSeconds": 1200}),  # forced refresh
+    ])
+    tp = InternalTokenProvider("k", "p", session=tp_sess)
+    xts_sess = FakeSession([
+        FakeResp(400, {"type": "error", "code": "e-session-0007", "description": "Invalid Token"}),
+        FakeResp(200, {"result": {"listQuotes": [json.dumps(_TOUCHLINE)]}}),  # retry OK
+    ])
+    ad = XTSDirectAdapter(token_provider=tp, session=xts_sess)
+    ins = [Instrument(2, 61492, "NIFTY 25AUG2026 PE 23400", "NIFTY", "25AUG2026", "PE", 23400, "OPTIDX")]
+    out = ad.fetch_touchline_for(ins)
+    assert out[61492][0].ltp == 125.35        # succeeded after refresh
+    assert len(tp_sess.calls) == 2            # token minted twice (initial + forced)
+
+
 def test_direct_instrument_parsing_capitalised_keys():
     ins = _to_instrument_direct({
         "ExchangeSegment": 2, "ExchangeInstrumentID": 61492,
