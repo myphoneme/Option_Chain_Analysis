@@ -6,15 +6,33 @@
   color-scheme: dark;
 }
 
+/* Portal page surface (quant-trade uses #0F172A). */
 body {
-  @apply bg-slate-950 text-slate-100 antialiased;
+  @apply bg-[#0F172A] text-slate-100 antialiased;
 }
 
+/* Active-pill glow, copied from the portal's index.css. */
+.pill-shadow {
+  box-shadow: 0 4px 14px 0 rgba(244, 121, 32, 0.39);
+}
+
+.custom-scrollbar::-webkit-scrollbar {
+  width: 6px;
+}
+.custom-scrollbar::-webkit-scrollbar-track {
+  background: transparent;
+}
+.custom-scrollbar::-webkit-scrollbar-thumb {
+  background: #334155;
+  border-radius: 10px;
+}
+
+/* Analyzer surfaces, aligned to the portal's card treatment. */
 .card {
-  @apply rounded-xl border border-slate-800 bg-slate-900/60 p-4 shadow-sm;
+  @apply rounded-xl border border-slate-800 bg-slate-900/50 p-4;
 }
 .label {
-  @apply text-xs uppercase tracking-wide text-slate-400;
+  @apply text-xs uppercase tracking-wide text-slate-500;
 }
 .pill {
   @apply inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-medium;

@@ -12,6 +12,7 @@ export async function fetchScripts(): Promise<ScriptOption[]> {
 export interface Meta {
   xts_mode: string;
   needs_user_token: boolean;
+  engine_version?: string;
 }
 
 export async function fetchMeta(): Promise<Meta> {

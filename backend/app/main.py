@@ -20,12 +20,13 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
+from app import __version__ as ENGINE_VERSION
 from app.engine import analyze
 from app.engine.models import ChainSnapshot, OptionQuote, StrikeRow
 from app.serialize import verdict_to_dict
 from app.demo_data import banknifty_case_study, banknifty_redesign_case, nifty_case_study
 
-app = FastAPI(title="Option Chain SOP Engine", version="0.1.0")
+app = FastAPI(title="Option Chain SOP Engine", version=ENGINE_VERSION)
 
 # Dev CORS: allow the Next.js frontend (localhost:3000). Tighten for production.
 app.add_middleware(
@@ -108,6 +109,7 @@ def meta():
         "xts_mode": settings.XTS_MODE,
         # In direct (server-to-server) mode the user does NOT supply a token.
         "needs_user_token": not direct,
+        "engine_version": ENGINE_VERSION,
     }
 
 
@@ -199,7 +201,7 @@ def _to_snapshot(c: ChainIn) -> ChainSnapshot:
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "sop-engine", "version": "0.1.0"}
+    return {"status": "ok", "service": "sop-engine", "version": ENGINE_VERSION}
 
 
 @app.get("/demo/{case}")
